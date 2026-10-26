@@ -1,0 +1,270 @@
+<?php
+
+declare(strict_types=1);
+
+namespace K9o\Data;
+
+use K9o\Envelope;
+use K9o\HttpClientConfig;
+use K9o\HttpTransport;
+use K9o\KError;
+use K9o\UrlGrammar;
+
+/**
+ * Data-plane DSL entry point.
+ *
+ * <code>
+ * $response = $k9o->from('posts')->select()->eq('status', 'published')->limit(10)->execute();
+ * foreach ($response->data as $row) { echo json_encode($row), PHP_EOL; }
+ * </code>
+ */
+final class FromBuilder
+{
+    public function __construct(
+        private readonly HttpClientConfig $config,
+        private readonly string $collection
+    ) {}
+
+    public function select(): SelectBuilder
+    {
+        return new SelectBuilder($this->config, $this->collection);
+    }
+
+    public function insert(array $record): Envelope
+    {
+        return HttpTransport::request(
+            $this->config, 'POST', self::collection_path($this->config, $this->collection), $record
+        );
+    }
+
+    public function update(array $patch): UpdateBuilder
+    {
+        return new UpdateBuilder($this->config, $this->collection, $patch);
+    }
+
+    public function delete(): DeleteBuilder
+    {
+        return new DeleteBuilder($this->config, $this->collection);
+    }
+
+    public static function collection_path(HttpClientConfig $config, string $collection): string
+    {
+        if ($config->project_slug === null || $config->project_slug === '') {
+            throw new KError(
+                'K9O_MISSING_PROJECT_CONTEXT',
+                'data-plane operations require project_slug to be bound on the client',
+                ['collection' => $collection],
+                'Pass "project_slug" in K9oClient::create opts.'
+            );
+        }
+        if (!preg_match('/^[a-z][a-z0-9_-]{0,62}$/', $collection)) {
+            throw new KError(
+                'K9O_INVALID_FIELD_VALUE',
+                sprintf('collection name "%s" does not match required format', $collection),
+                ['collection' => $collection]
+            );
+        }
+        return UrlGrammar::project_path($config->project_slug, 'data/' . $collection);
+    }
+}
+
+/**
+ * Shared filter/pagination state.
+ */
+abstract class BaseBuilder
+{
+    /** @var list<array{0: string, 1: string, 2: string}> */
+    protected array $filters = [];
+    protected ?int $limit_val = null;
+    protected ?string $cursor_val = null;
+    protected ?string $count_mode = null;
+
+    /** A filter value as the gateway reads it: booleans are `true` / `false` (PHP would cast them to `1` and an empty string). */
+    private static function wire(mixed $value): string
+    {
+        if (is_bool($value)) {
+            return $value ? 'true' : 'false';
+        }
+        return (string) $value;
+    }
+
+    public function eq(string $column, mixed $value): static { $this->filters[] = [$column, 'eq', self::wire($value)]; return $this; }
+    public function neq(string $column, mixed $value): static { $this->filters[] = [$column, 'neq', self::wire($value)]; return $this; }
+    public function gt(string $column, mixed $value): static { $this->filters[] = [$column, 'gt', self::wire($value)]; return $this; }
+    public function gte(string $column, mixed $value): static { $this->filters[] = [$column, 'gte', self::wire($value)]; return $this; }
+    public function lt(string $column, mixed $value): static { $this->filters[] = [$column, 'lt', self::wire($value)]; return $this; }
+    public function lte(string $column, mixed $value): static { $this->filters[] = [$column, 'lte', self::wire($value)]; return $this; }
+    public function like(string $column, string $pattern): static { $this->filters[] = [$column, 'like', $pattern]; return $this; }
+    public function ilike(string $column, string $pattern): static { $this->filters[] = [$column, 'ilike', $pattern]; return $this; }
+    public function is(string $column, string $value): static { $this->filters[] = [$column, 'is', $value]; return $this; }
+
+    public function in(string $column, array $values): static
+    {
+        $this->filters[] = [$column, 'in', '(' . implode(',', array_map(fn($v) => self::wire($v), $values)) . ')'];
+        return $this;
+    }
+    public function not_in(string $column, array $values): static
+    {
+        $this->filters[] = [$column, 'notIn', '(' . implode(',', array_map(fn($v) => self::wire($v), $values)) . ')'];
+        return $this;
+    }
+    public function filter(string $column, string $op, mixed $value): static
+    {
+        $this->filters[] = [$column, $op, self::wire($value)];
+        return $this;
+    }
+
+    public function limit(int $n): static { $this->limit_val = $n; return $this; }
+    public function cursor(string $opaque): static { $this->cursor_val = $opaque; return $this; }
+    public function count(string $mode): static { $this->count_mode = $mode; return $this; }
+
+    /** @return array<string, string> */
+    protected function to_query(): array
+    {
+        $q = [];
+        foreach ($this->filters as [$col, $op, $val]) {
+            $q[$col] = str_starts_with($val, '(') ? $op . '.' . $val : $op . '.' . $val;
+        }
+        if ($this->limit_val !== null) $q['limit'] = (string) $this->limit_val;
+        if ($this->cursor_val !== null) $q['cursor'] = $this->cursor_val;
+        if ($this->count_mode !== null) $q['count'] = $this->count_mode;
+        return $q;
+    }
+}
+
+final class SelectBuilder extends BaseBuilder
+{
+    /** @var array<string, string> */
+    private array $search = [];
+
+    public function __construct(
+        private readonly HttpClientConfig $config,
+        private readonly string $collection
+    ) {}
+
+    private static function invalid(string $message): KError
+    {
+        return new KError('K9O_INVALID_FIELD_VALUE', $message);
+    }
+
+    private static function check_column(string $column): void
+    {
+        if (preg_match('/^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/', $column) !== 1) {
+            throw self::invalid('search column must be a column name: letters, digits and underscores, starting with a letter or underscore');
+        }
+    }
+
+    /** Full-text search over one text column. `$type` is "plain", "phrase" or "websearch". */
+    public function text_search(string $column, string $query, string $language = 'english', string $type = 'plain'): static
+    {
+        self::check_column($column);
+        if ($query === '') {
+            throw self::invalid('text search query must be a non-empty string');
+        }
+        if (preg_match('/^[a-zA-Z_]+$/', $language) !== 1) {
+            throw self::invalid('text search language must be letters and underscores only');
+        }
+        if (!in_array($type, ['plain', 'phrase', 'websearch'], true)) {
+            throw self::invalid('text search type must be one of plain, phrase, websearch');
+        }
+        unset($this->search['textSearchLanguage'], $this->search['textSearchType']);
+        $this->search['textSearch'] = $column . ':' . $query;
+        if ($language !== 'english') $this->search['textSearchLanguage'] = $language;
+        if ($type !== 'plain') $this->search['textSearchType'] = $type;
+        return $this;
+    }
+
+    /**
+     * Nearest-neighbour search over one vector column; results come back closest first.
+     * `$metric` is "cosine", "euclidean" or "dot"; `$limit` is 1 to 1000 (server default 10).
+     *
+     * @param list<int|float> $embedding
+     */
+    public function vector_search(string $column, array $embedding, string $metric = 'cosine', ?int $limit = null): static
+    {
+        self::check_column($column);
+        if ($embedding === [] || !array_is_list($embedding)) {
+            throw self::invalid('embedding must be a non-empty list of finite numbers');
+        }
+        foreach ($embedding as $v) {
+            if (!(is_int($v) || (is_float($v) && is_finite($v)))) {
+                throw self::invalid('embedding must be a non-empty list of finite numbers');
+            }
+        }
+        if (!in_array($metric, ['cosine', 'euclidean', 'dot'], true)) {
+            throw self::invalid('vector metric must be one of cosine, euclidean, dot');
+        }
+        if ($limit !== null && ($limit < 1 || $limit > 1000)) {
+            throw self::invalid('vector limit must be an integer from 1 to 1000');
+        }
+        unset($this->search['vectorMetric'], $this->search['vectorLimit']);
+        $this->search['vectorSearch'] = $column . ':' . json_encode($embedding);
+        if ($metric !== 'cosine') $this->search['vectorMetric'] = $metric;
+        if ($limit !== null) $this->search['vectorLimit'] = (string) $limit;
+        return $this;
+    }
+
+    public function execute(): Envelope
+    {
+        return HttpTransport::request(
+            $this->config, 'GET', FromBuilder::collection_path($this->config, $this->collection), null, $this->to_query() + $this->search
+        );
+    }
+}
+
+final class UpdateBuilder extends BaseBuilder
+{
+    public function __construct(
+        private readonly HttpClientConfig $config,
+        private readonly string $collection,
+        private readonly array $patch
+    ) {}
+
+    public function execute(): Envelope
+    {
+        $id_val = null;
+        foreach ($this->filters as [$col, $op, $val]) {
+            if ($col === 'id' && $op === 'eq') {
+                $id_val = $val;
+                break;
+            }
+        }
+        if ($id_val === null) {
+            throw new KError(
+                'K9O_INVALID_FIELD_VALUE',
+                'update() requires ->eq("id", ...) filter; changing many rows in one call is not supported',
+                ['collection' => $this->collection]
+            );
+        }
+        $path = FromBuilder::collection_path($this->config, $this->collection) . '/' . rawurlencode($id_val);
+        return HttpTransport::request($this->config, 'PATCH', $path, $this->patch);
+    }
+}
+
+final class DeleteBuilder extends BaseBuilder
+{
+    public function __construct(
+        private readonly HttpClientConfig $config,
+        private readonly string $collection
+    ) {}
+
+    public function execute(): Envelope
+    {
+        $id_val = null;
+        foreach ($this->filters as [$col, $op, $val]) {
+            if ($col === 'id' && $op === 'eq') {
+                $id_val = $val;
+                break;
+            }
+        }
+        if ($id_val === null) {
+            throw new KError(
+                'K9O_INVALID_FIELD_VALUE',
+                'delete() requires ->eq("id", ...) filter; deleting many rows in one call is not supported',
+                ['collection' => $this->collection]
+            );
+        }
+        $path = FromBuilder::collection_path($this->config, $this->collection) . '/' . rawurlencode($id_val);
+        return HttpTransport::request($this->config, 'DELETE', $path);
+    }
+}

@@ -1,0 +1,31 @@
+{
+    "name": "k9o/sdk",
+    "description": "Kilimanjaro platform SDK — create_client + data DSL + projects + gate + studio (workflows/dashboards) + compute.llms + realtime subscriptions + KError. PHP idiomatic (snake_case; throw K9o\\KError; Generator for SSE streams).",
+    "type": "library",
+    "license": "Apache-2.0",
+    "keywords": ["kilimanjaro", "k9o", "sdk", "platform"],
+    "homepage": "https://kilimanjaro.dev",
+    "support": { "docs": "https://docs.kilimanjaro.dev" },
+    "require": {
+        "php": ">=8.5.12",
+        "ext-json": "*",
+        "ext-curl": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "K9o\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "K9o\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}
